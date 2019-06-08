@@ -15,7 +15,7 @@
 *
 */
 metadata {
-    definition (name: "Enhanced GE ZigBee Dimmer Power", namespace: "smartthings", author: "jhamstead", ocfDeviceType: "oic.d.light") {
+    definition (name: "Enhanced GE ZigBee Dimmer Power", namespace: "smartthings", author: "jhamstead", ocfDeviceType: "oic.d.light", runLocally: true, minHubCoreVersion: '000.019.00012', executeCommandsLocally: true, genericHandler: "Zigbee") {
         capability "Actuator"
         capability "Configuration"
         capability "Refresh"
