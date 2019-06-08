@@ -52,9 +52,21 @@ metadata {
         main "switch"
         details(["switch", "refresh"])
     }
+    preferences {
+        section ("Zigbee Dimmer Properties"){
+            input "transitionTime", "number", title: "Tranistion Time (0-15)", description: true, defaultValue: 5, required: false, range: "0..15"
+            input "minLevel", "number", title: "Minimum Dimmer Level (1-50)", description: true, defaultValue: 1, required: false, range: "1..50"
+            input "maxLevel", "number", title: "Maximum Dimmer Level (51-100)", description: true, defaultValue: 100, required: false, range: "51..100"
+        }
+    }
 }
 
-// Parse incoming device messages to generate events
+private getCLUSTER_LEVEL() { 0x0008 }
+private getLEVEL_CMD_MOVE_TO_LEVEL_ON_OFF() { 0x04 }
+//private getLEVEL_ATTR_ON_OFF_TRANSITION_TIME() { 0x0010 }
+private getLEVEL_ATTR_ON_LEVEL() { 0x0011 }
+
+    // Parse incoming device messages to generate events
 def parse(String description) {
     log.debug "description is $description"
 
@@ -70,27 +82,19 @@ def parse(String description) {
         else {
             sendEvent(event)
         }
-    } else {
-        def descMap = zigbee.parseDescriptionAsMap(description)
-        if (descMap && descMap.clusterInt == 0x0006 && descMap.commandInt == 0x07) {
-            if (descMap.data[0] == "00") {
+    }
+    else {
+        def cluster = zigbee.parse(description)
+        if (cluster && cluster.clusterId == 0x0006 && cluster.command == 0x07) {
+            if (cluster.data[0] == 0x00){
                 log.debug "ON/OFF REPORTING CONFIG RESPONSE: " + cluster
                 sendEvent(name: "checkInterval", value: 60 * 12, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID])
-            } else {
+            }
+            else {
                 log.warn "ON/OFF REPORTING CONFIG FAILED- error code:${cluster.data[0]}"
             }
-        } else if (device.getDataValue("manufacturer") == "sengled" && descMap && descMap.clusterInt == 0x0008 && descMap.attrInt == 0x0000) {
-            // This is being done because the sengled element touch incorrectly uses the value 0xFF for the max level.
-            // Per the ZCL spec for the UINT8 data type 0xFF is an invalid value, and 0xFE should be the max.  Here we
-            // manually handle the invalid attribute value since it will be ignored by getEvent as an invalid value.
-            // We also set the level of the bulb to 0xFE so future level reports will be 0xFE until it is changed by
-            // something else.
-            if (descMap.value.toUpperCase() == "FF") {
-                descMap.value = "FE"
-            }
-            sendHubCommand(zigbee.command(zigbee.LEVEL_CONTROL_CLUSTER, 0x00, "FE0000").collect { new physicalgraph.device.HubAction(it) }, 0)
-            sendEvent(zigbee.getEventFromAttrData(descMap.clusterInt, descMap.attrInt, descMap.encoding, descMap.value))
-        } else {
+        }
+        else {
             log.warn "DID NOT PARSE MESSAGE for description : $description"
             log.debug zigbee.parseDescriptionAsMap(description)
         }
@@ -98,48 +102,66 @@ def parse(String description) {
 }
 
 def off() {
-    zigbee.off()
+    //zigbee.off()
+    state.currentLevel = (device.currentValue('level')) ? device.currentValue('level') : state.currentLevel
+    def onLevel = (state.currentLevel && state.currentLevel < 100) ? state.currentLevel * 2.55 : 254
+    def cmds = setLevel(0, true) + zigbee.writeAttribute(CLUSTER_LEVEL, LEVEL_ATTR_ON_LEVEL, 0x20, zigbee.convertToHexString(onLevel,2))
+    log.info "off() -- cmds: $cmds -- $state.currentLevel"
+    return cmds
 }
 
 def on() {
-    zigbee.on()
+    //zigbee.on()
+    def value = (state.currentLevel) ? state.currentLevel : myMaxLevel
+    def cmds = setLevel(value)
+    log.info "on() -- cmds: $cmds -- $state.currentLevel"
+    return cmds
 }
 
-def setLevel(value, rate = null) {
-    zigbee.setLevel(value) + (value?.toInteger() > 0 ? zigbee.on() : [])
+def setLevel(value, dontSetOnLevel=false) {
+    //zigbee.setLevel(value)
+    def cmds
+    def myTime = (transitionTime) ? transitionTime : 5
+    def myMinLevel = (minLevel) ? minLevel : 1
+    def myMaxLevel = (maxLevel) ? maxLevel : 100
+    if ( value && value < myMinLevel ) {
+        value = myMinLevel
+    } else if ( value > myMaxLevel ) {
+        value = myMaxLevel
+    }
+    def myLevel = ( value < 100 ) ? value * 2.55 : 254
+    if (dontSetOnLevel) {
+        cmds = zigbee.command(CLUSTER_LEVEL, LEVEL_CMD_MOVE_TO_LEVEL_ON_OFF, zigbee.convertToHexString(myLevel,2) + zigbee.convertToHexString(myTime,2) + "00")
+    } else {
+        def myOnLevel = myLevel
+        state.currentLevel = value
+        if ( ! value ) {
+            myOnLevel = ( myMaxLevel < 100 ) ? myMaxLevel * 2.55 : 254
+            state.currentLevel = myMaxLevel
+        }
+        cmds = zigbee.command(CLUSTER_LEVEL, LEVEL_CMD_MOVE_TO_LEVEL_ON_OFF, zigbee.convertToHexString(myLevel,2) + zigbee.convertToHexString(myTime,2) + "00") +
+               zigbee.writeAttribute(CLUSTER_LEVEL, LEVEL_ATTR_ON_LEVEL, 0x20, zigbee.convertToHexString(myOnLevel,2))
+    }
+    log.info "setLevel() -- cmds: $cmds -- $state.currentLevel"
+    return cmds
 }
 
-/**
- * PING is used by Device-Watch in attempt to reach the Device
- * */
+    /**
+     * PING is used by Device-Watch in attempt to reach the Device
+     * */
 def ping() {
     return zigbee.onOffRefresh()
 }
 
 def refresh() {
-    def cmds = zigbee.onOffRefresh() + zigbee.levelRefresh() + zigbee.simpleMeteringPowerRefresh() + zigbee.electricMeasurementPowerRefresh()
-    if (device.getDataValue("manufacturer") == "Jasco Products") {
-        // Some versions of hub firmware will incorrectly remove this binding causing manual control of switch to stop working
-        // These needs to be the first binding table entries because the device will automatically write these entries each time it restarts
-        cmds += ["zdo bind 0x${device.deviceNetworkId} 2 1 0x0006 {${device.zigbeeId}} {${device.zigbeeId}}", "delay 2000",
-                 "zdo bind 0x${device.deviceNetworkId} 2 1 0x0008 {${device.zigbeeId}} {${device.zigbeeId}}", "delay 2000"]
-    }
-    cmds + zigbee.onOffConfig(0, 300) + zigbee.levelConfig() + zigbee.simpleMeteringPowerConfig() + zigbee.electricMeasurementPowerConfig()
+    zigbee.onOffRefresh() + zigbee.levelRefresh() + zigbee.simpleMeteringPowerRefresh() + zigbee.electricMeasurementPowerRefresh() + zigbee.onOffConfig(0, 300) + zigbee.levelConfig() + zigbee.simpleMeteringPowerConfig() + zigbee.electricMeasurementPowerConfig()
 }
 
 def configure() {
     log.debug "Configuring Reporting and Bindings."
-    def cmds = []
-    if (device.getDataValue("manufacturer") == "sengled") {
-        def startLevel = 0xFE
-        if ((device.currentState("level")?.value != null)) {
-            startLevel = Math.round(Integer.parseInt(device.currentState("level").value) * 0xFE / 100)
-        }
-        // Level Control Cluster, command Move to Level, level start level, transition time 0
-        cmds << zigbee.command(zigbee.LEVEL_CONTROL_CLUSTER, 0x00, sprintf("%02X0000", startLevel))
-    }
+
     // Device-Watch allows 2 check-in misses from device + ping (plus 1 min lag time)
     // enrolls with default periodic reporting until newer 5 min interval is confirmed
     sendEvent(name: "checkInterval", value: 2 * 60 * 60 + 1 * 60, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID])
-    cmds + refresh()
+    refresh()
 }
